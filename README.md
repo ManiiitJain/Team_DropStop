@@ -66,15 +66,3 @@ Backend/Database → PostgreSQL (via psycopg2)
 AI Chatbot → Google Gemini
  (google-generativeai)
  
-
-📂 Project Structure
-project/
-│── app.py                # Main Streamlit app (the code you provided)
-│── requirements.txt       # Python dependencies
-│── README.md              # Documentation
-└── data/                  # (Optional) Sample CSV files
-
-
-Visualization → Matplotlib
-
-Emailing → Python smtplib + email.message
