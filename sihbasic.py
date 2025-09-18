@@ -1,334 +1,455 @@
-# student_risk_dashboard.py
-
+import streamlit as st
 import psycopg2
 import pandas as pd
-import streamlit as st
+import string
 import matplotlib.pyplot as plt
-from datetime import datetime, timedelta
+from psycopg2.extras import execute_values
+from psycopg2 import sql
+from datetime import datetime
+import smtplib
+from email.message import EmailMessage
+import google.generativeai as genai  # ✅ Gemini import
 
 # -----------------------------
-# Database Connection Helper
+# CONFIGURATION
 # -----------------------------
-DB_URL = "postgresql://postgres:Manitjain009.@db.ixhqsbvdalrefnotxmqi.supabase.co:5432/postgres"
+genai.configure(api_key="YOUR_GEMINI_API_KEY")  # ✅ Replace with your Gemini API key
+DB_URL = "postgresql://postgres.ixhqsbvdalrefnotxmqi:wwcbN4nmUC1YLW9C@aws-1-ap-southeast-1.pooler.supabase.com:6543/postgres"
+STUDENTS_PER_MENTOR = 50
 
+# -----------------------------
+# SESSION STATE INITIALIZATION
+# -----------------------------
+def init_session_state():
+    defaults = {
+        "role": None,
+        "mentor_id": None,
+        "student_id": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
+init_session_state()
+
+# -----------------------------
+# DATABASE CONNECTION
+# -----------------------------
 def get_connection():
     return psycopg2.connect(DB_URL, sslmode="require")
 
+# -----------------------------
+# LOG USER LOGIN
+# -----------------------------
+def log_user_login(username):
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO logins (username, login_time) VALUES (%s, %s)",
+            (username, datetime.now())
+        )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        st.error(f"❌ Failed to log login: {e}")
+    finally:
+        cur.close()
+        conn.close()
 
+# -----------------------------
+# CSV UPLOAD FUNCTION
+# -----------------------------
+def insert_csv_to_table(csv_file, table_name, conn):
+    df = pd.read_csv(csv_file)
+    if df.empty:
+        st.warning(f"{table_name} CSV is empty, skipping...")
+        return
+
+    if table_name == "student":
+        if "student_email" in df.columns:
+            df.rename(columns={"student_email": "email"}, inplace=True)
+        if "dob" in df.columns:
+            df.drop(columns=["dob"], inplace=True)
+
+    cursor = conn.cursor()
+    cols = list(df.columns)
+
+    values = [
+        tuple(
+            None if pd.isna(x) else
+            int(x) if isinstance(x, (int, float)) and float(x).is_integer() else
+            float(x) if isinstance(x, (int, float)) else
+            str(x)
+            for x in row
+        )
+        for row in df.to_numpy()
+    ]
+
+    insert_stmt = sql.SQL("INSERT INTO {table} ({fields}) VALUES %s").format(
+        table=sql.Identifier(table_name),
+        fields=sql.SQL(',').join(map(sql.Identifier, cols))
+    )
+    try:
+        execute_values(cursor, insert_stmt, values)
+        conn.commit()
+        st.success(f"✅ Uploaded {len(df)} rows into {table_name}")
+    except Exception as e:
+        conn.rollback()
+        st.error(f"❌ Error inserting into {table_name}: {e}")
+    finally:
+        cursor.close()
+
+# -----------------------------
+# FETCH STUDENTS
+# -----------------------------
 def fetch_students():
     conn = get_connection()
     query = """
-        SELECT s.id,
-               s.name,
-               s.email,
-               s.contact_no,
-               COALESCE(AVG(a.attendance), 0) AS attendance_percentage,
-               COALESCE(AVG(m.maths), 0) AS maths,
-               COALESCE(AVG(m.dsa), 0) AS dsa,
-               COALESCE(AVG(m.oop), 0) AS oop,
-               COALESCE(AVG(m.economics), 0) AS economics,
-               COALESCE(SUM(f.amount), 0) AS fees_paid
+        SELECT s.id, s.name, s.email, s.parent_email, s.contact_no,
+               COALESCE(a.total_attendance,0) AS total_attendance,
+               COALESCE(m.maths,0) AS maths,
+               COALESCE(m.dsa,0) AS dsa,
+               COALESCE(m.oop,0) AS oop,
+               COALESCE(m.economics,0) AS economics,
+               COALESCE(f.fee_status,'pending') AS fee_status
         FROM student s
         LEFT JOIN attendance a ON s.id = a.student_id
         LEFT JOIN marks m ON s.id = m.student_id
         LEFT JOIN fees f ON s.id = f.student_id
-        GROUP BY s.id, s.name, s.email, s.contact_no
         ORDER BY s.id;
     """
     df = pd.read_sql(query, conn)
     conn.close()
     return df
 
+# -----------------------------
+# MENTOR ALLOCATION
+# -----------------------------
+def generate_mentor_ids(num_students, students_per_mentor=STUDENTS_PER_MENTOR):
+    alphabet = list(string.ascii_uppercase)
+    mentor_ids = []
+    count, i = 0, 0
+    while count < num_students:
+        if i < 26:
+            mentor_ids.append(f"Mentor {alphabet[i]}")
+        else:
+            prefix = (i // 26) - 1
+            suffix = i % 26
+            mentor_ids.append(f"Mentor {alphabet[prefix]}{alphabet[suffix]}")
+        count += students_per_mentor
+        i += 1
+    return mentor_ids
 
-def log_login(username):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO mentor_logins (username, login_time) VALUES (%s, NOW())", (username,))
-    conn.commit()
-    conn.close()
-
+def assign_students_to_mentors(student_df):
+    num_students = len(student_df)
+    mentor_ids = generate_mentor_ids(num_students)
+    allocation = {}
+    idx = 0
+    for mentor in mentor_ids:
+        allocation[mentor] = student_df.iloc[idx: idx + STUDENTS_PER_MENTOR]
+        idx += STUDENTS_PER_MENTOR
+    return allocation
 
 # -----------------------------
-# Add / Delete Student
+# RISK CALCULATION
 # -----------------------------
-def add_student(name, email, contact_no, attendance, maths, dsa, oop, economics, fees_paid):
-    conn = get_connection()
-    cur = conn.cursor()
-
-    # Insert student
-    cur.execute(
-        "INSERT INTO student (name, email, contact_no) VALUES (%s, %s, %s) RETURNING id",
-        (name, email, contact_no),
-    )
-    student_id = cur.fetchone()[0]
-
-    # Insert attendance
-    cur.execute(
-        "INSERT INTO attendance (student_id, attendance) VALUES (%s, %s)",
-        (student_id, attendance),
-    )
-
-    # Insert marks
-    cur.execute(
-        "INSERT INTO marks (student_id, maths, dsa, oop, economics) VALUES (%s, %s, %s, %s, %s)",
-        (student_id, maths, dsa, oop, economics),
-    )
-
-    # Insert fees
-    cur.execute(
-        "INSERT INTO fees (student_id, amount) VALUES (%s, %s)",
-        (student_id, fees_paid),
-    )
-
-    conn.commit()
-    conn.close()
-
-
-def delete_student(student_id):
-    conn = get_connection()
-    cur = conn.cursor()
-    # Delete related records first (to avoid foreign key issues)
-    cur.execute("DELETE FROM attendance WHERE student_id=%s", (student_id,))
-    cur.execute("DELETE FROM marks WHERE student_id=%s", (student_id,))
-    cur.execute("DELETE FROM fees WHERE student_id=%s", (student_id,))
-    cur.execute("DELETE FROM student WHERE id=%s", (student_id,))
-    conn.commit()
-    conn.close()
-
-
-# -----------------------------
-# Risk Calculation
-# -----------------------------
-TOTAL_FEES = 30000
-
-
 def calculate_risk(row):
-    risk_flags = []
-    if row['attendance_percentage'] < 75:
-        risk_flags.append("Low Attendance")
+    flags = []
+    if row['total_attendance'] < 75:
+        flags.append("Low Attendance")
     avg_score = (row['maths'] + row['dsa'] + row['oop'] + row['economics']) / 4
     if avg_score < 40:
-        risk_flags.append("Low Marks")
-    if row['fees_paid'] < 0.5 * TOTAL_FEES:
-        risk_flags.append("Fee Pending")
-    return ", ".join(risk_flags) if risk_flags else "OK"
-
+        flags.append("Low Marks")
+    if str(row['fee_status']).lower() != "paid":
+        flags.append("Fee Pending")
+    return ", ".join(flags) if flags else "OK"
 
 def assign_risk_level(row):
     avg_score = (row['maths'] + row['dsa'] + row['oop'] + row['economics']) / 4
-    if (row['attendance_percentage'] < 50 or avg_score < 30 or row['fees_paid'] < 0.25 * TOTAL_FEES):
+    if row['total_attendance'] < 50 or avg_score < 30 or str(row['fee_status']).lower() != "paid":
         return "High"
-    elif (50 <= row['attendance_percentage'] < 75 or 30 <= avg_score < 40 or
-          0.25 * TOTAL_FEES <= row['fees_paid'] < 0.5 * TOTAL_FEES):
+    elif 50 <= row['total_attendance'] < 75 or 30 <= avg_score < 40:
         return "Medium"
-    elif (75 <= row['attendance_percentage'] < 80 or 40 <= avg_score < 50):
+    elif 75 <= row['total_attendance'] < 80 or 40 <= avg_score < 50:
         return "Low"
     else:
         return "OK"
 
+def highlight_risk(row):
+    colors = {"OK": "lightgreen", "Low": "yellow", "Medium": "orange", "High": "red"}
+    return ["background-color: %s" % colors.get(row.get("risk_level", ""), "")] * len(row)
 
 # -----------------------------
-# Dynamic Mentor Assignment
+# AI CHATBOT (Gemini)
 # -----------------------------
-MAX_STUDENTS_PER_MENTOR = 10
-
-
-def assign_mentors(df):
-    num_students = len(df)
-    num_mentors = (num_students + MAX_STUDENTS_PER_MENTOR - 1) // MAX_STUDENTS_PER_MENTOR
-    mentors = [f"Mentor {chr(65 + i)}" for i in range(num_mentors)]  # A, B, C ...
-
-    mentor_list = []
-    for i, _ in enumerate(df.itertuples()):
-        mentor_index = i // MAX_STUDENTS_PER_MENTOR
-        mentor_list.append(mentors[mentor_index])
-
-    df['mentor'] = mentor_list
-    return df
-
+def chat_with_ai(user_message):
+    try:
+        model = genai.GenerativeModel("gemini-1.5-flash")  # ✅ using Gemini
+        response = model.generate_content(user_message)
+        return response.text
+    except Exception as e:
+        return f"Error: {str(e)}"
 
 # -----------------------------
-# Login System
+# EMAIL FUNCTION
 # -----------------------------
-USERS = {
-    "Admin": "Supermentor@123",  # Super Mentor
-    "Mentor A": "MentorA@123",
-    "Mentor B": "MentorB@123",
-    "Mentor C": "MentorC@123",
-    "Mentor D": "MentorD@123",
-    "Mentor E": "MentorE@123"
-}
+def send_email_to_parent(student, sender_email, app_password):
+    parent_email = student.get('parent_email', None)
+    if not parent_email:
+        return
 
-st.title("📊 Student Risk Dashboard")
+    subject = f"Performance Report: {student['name']}"
+    body = f"""
+Hello Parent,
 
-# Session defaults
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-if "last_activity" not in st.session_state:
-    st.session_state.last_activity = None
-if "username" not in st.session_state:
-    st.session_state.username = None
+Here is the performance summary for your child, {student['name']}:
 
+Attendance: {student['total_attendance']}%
+Maths: {student['maths']}
+DSA: {student['dsa']}
+OOP: {student['oop']}
+Economics: {student['economics']}
+Fee Status: {student['fee_status']}
+Risk Level: {student['risk_level']}
 
-def logout():
-    st.session_state.logged_in = False
-    st.session_state.username = None
-    st.session_state.last_activity = None
-    st.warning("⏳ Session expired or logged out. Please log in again.")
+Regards,
+Academic Team
+"""
 
+    try:
+        msg = EmailMessage()
+        msg['From'] = sender_email
+        msg['To'] = parent_email
+        msg['Subject'] = subject
+        msg.set_content(body)
 
-# Auto logout after 5 minutes
-if st.session_state.logged_in and st.session_state.last_activity:
-    if datetime.now() - st.session_state.last_activity > timedelta(minutes=5):
-        logout()
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+            smtp.login(sender_email, app_password)
+            smtp.send_message(msg)
+
+        st.success(f"✅ Email sent to {parent_email}")
+    except Exception as e:
+        st.error(f"❌ Failed to send email to {parent_email}: {e}")
 
 # -----------------------------
-# LOGIN FORM
+# LOGOUT
 # -----------------------------
-if not st.session_state.logged_in:
-    username = st.text_input("👤 Username")
-    password = st.text_input("🔑 Password", type="password")
+def logout_button():
+    if st.sidebar.button("🚪 Logout"):
+        st.session_state.clear()
+        st.success("You have been logged out")
+        st.stop()
 
+# -----------------------------
+# LOGIN PAGE
+# -----------------------------
+def login_page():
+    st.title("Login Portal")
+    user_id = st.text_input("User ID")
+    password = st.text_input("Password", type="password")
     if st.button("Login"):
-        if username in USERS and password == USERS[username]:
-            st.session_state.logged_in = True
-            st.session_state.username = username
-            st.session_state.last_activity = datetime.now()
-            log_login(username)
-            st.success(f"✅ Logged in as {username}")
-            st.rerun()
+        if user_id == "Admin" and password == "Admin@123":
+            st.session_state["role"] = "admin"
+            st.success("Logged in as Admin")
+            log_user_login(user_id)
+            st.stop()
+        elif user_id.startswith("Mentor"):
+            mentor_name = user_id.split(" ")[1] if len(user_id.split(" ")) > 1 else ""
+            if password == f"Mentor{mentor_name}@123":
+                st.session_state["role"] = "mentor"
+                st.session_state["mentor_id"] = user_id
+                st.success(f"Logged in as {user_id}")
+                log_user_login(user_id)
+                st.stop()
+            else:
+                st.error("Invalid Mentor credentials")
+        elif user_id.lower().startswith("student_"):
+            try:
+                sid = int(user_id.split("_")[1])
+                if password == f"student_{sid}@123":
+                    st.session_state["role"] = "student"
+                    st.session_state["student_id"] = sid
+                    st.success(f"Logged in as Student {sid}")
+                    log_user_login(user_id)
+                    st.stop()
+                else:
+                    st.error("Invalid Student credentials")
+            except:
+                st.error("Invalid Student ID format")
         else:
-            st.error("❌ Invalid credentials. Try again.")
+            st.error("Invalid credentials")
 
 # -----------------------------
-# DASHBOARD (Only if logged in)
+# ADMIN PAGE
 # -----------------------------
-if st.session_state.logged_in:
-    st.session_state.last_activity = datetime.now()
+def admin_page():
+    logout_button()
+    st.header("🛠 Admin Dashboard")
+
+    # Email config only for Admin
+    st.sidebar.title("📧 Email Config")
+    sender_email = st.sidebar.text_input("Sender Gmail")
+    app_password = st.sidebar.text_input("App Password", type="password")
+
+    conn = get_connection()
+    student_file = st.file_uploader("Upload Student CSV", type=["csv"], key="stu")
+    attendance_file = st.file_uploader("Upload Attendance CSV", type=["csv"], key="att")
+    fees_file = st.file_uploader("Upload Fees CSV", type=["csv"], key="fee")
+    marks_file = st.file_uploader("Upload Marks CSV", type=["csv"], key="mar")
+
+    if st.button("Upload All CSVs"):
+        if student_file and attendance_file and fees_file and marks_file:
+            insert_csv_to_table(student_file, "student", conn)
+            insert_csv_to_table(attendance_file, "attendance", conn)
+            insert_csv_to_table(fees_file, "fees", conn)
+            insert_csv_to_table(marks_file, "marks", conn)
+        else:
+            st.error("Upload all 4 CSVs")
+    conn.close()
+
+    df = fetch_students()
+    df['risk_status'] = df.apply(calculate_risk, axis=1).astype(str)
+    df['risk_level'] = df.apply(assign_risk_level, axis=1).astype(str)
+
+    st.subheader("📋 All Students")
+    st.dataframe(df.style.apply(highlight_risk, axis=1))
+
+    st.subheader("📊 Risk Distribution")
+    counts = df['risk_level'].value_counts()
+    color_map = {"OK": "lightgreen", "Low": "yellow", "Medium": "orange", "High": "red"}
+    fig, ax = plt.subplots()
+    ax.pie(
+        [counts.get(l, 0) for l in ["OK", "Low", "Medium", "High"]],
+        labels=["OK", "Low", "Medium", "High"],
+        autopct="%1.1f%%",
+        startangle=90,
+        colors=[color_map["OK"], color_map["Low"], color_map["Medium"], color_map["High"]],
+    )
+    ax.axis("equal")
+    st.pyplot(fig)
+
+    # Send real emails (only if config filled)
+    if sender_email and app_password:
+        st.subheader("📨 Send Performance Emails to Parents")
+        if st.button("Send Emails to All Students"):
+            for _, student in df.iterrows():
+                send_email_to_parent(student, sender_email, app_password)
+    else:
+        st.info("Enter Gmail + App Password in sidebar to enable email sending.")
+
+# -----------------------------
+# MENTOR PAGE
+# -----------------------------
+def mentor_page():
+    mentor_id = st.session_state.get("mentor_id")
+    if not mentor_id:
+        st.warning("Mentor not logged in. Please login first.")
+        login_page()
+        return
+
+    logout_button()
+    st.header(f"👨‍🏫 Mentor Dashboard - {mentor_id}")
+
+    # Email config only for Mentor
+    st.sidebar.title("📧 Email Config")
+    sender_email = st.sidebar.text_input("Sender Gmail")
+    app_password = st.sidebar.text_input("App Password", type="password")
 
     df = fetch_students()
     df['risk_status'] = df.apply(calculate_risk, axis=1)
-    df['dropout_label'] = df['risk_status'].apply(lambda x: 0 if x == "OK" else 1)
     df['risk_level'] = df.apply(assign_risk_level, axis=1)
-    df = assign_mentors(df)
+    allocation = assign_students_to_mentors(df)
+    mentor_students = allocation.get(mentor_id, pd.DataFrame())
 
-    username = st.session_state.username
-
-    # -----------------------------
-    # SUPER MENTOR VIEW
-    # -----------------------------
-    if username == "Admin":
-        st.subheader("🛠 Super Mentor Controls")
-
-        # Add student form
-        with st.expander("➕ Add New Student"):
-            new_name = st.text_input("Name")
-            new_email = st.text_input("Email")
-            new_contact = st.text_input("Contact No")
-            new_attendance = st.number_input("Attendance %", min_value=0.0, max_value=100.0, value=75.0)
-            new_maths = st.number_input("Maths Marks", min_value=0.0, max_value=100.0, value=50.0)
-            new_dsa = st.number_input("DSA Marks", min_value=0.0, max_value=100.0, value=50.0)
-            new_oop = st.number_input("OOP Marks", min_value=0.0, max_value=100.0, value=50.0)
-            new_economics = st.number_input("Economics Marks", min_value=0.0, max_value=100.0, value=50.0)
-            new_fees = st.number_input("Fees Paid", min_value=0.0, value=0.0)
-
-            if st.button("Add Student"):
-                if new_name and new_email and new_contact:
-                    add_student(new_name, new_email, new_contact,
-                                new_attendance, new_maths, new_dsa, new_oop, new_economics, new_fees)
-                    st.success("✅ Student added successfully!")
-                    st.rerun()
-                else:
-                    st.error("⚠️ Name, Email and Contact are required!")
-
-        # Delete student form
-        with st.expander("🗑 Delete Student"):
-            student_to_delete = st.selectbox("Select Student to Delete", df['name'])
-            student_id = df[df['name'] == student_to_delete]['id'].iloc[0]
-            if st.button("Delete Student"):
-                delete_student(student_id)
-                st.warning(f"🚨 Student {student_to_delete} deleted!")
-                st.rerun()
-
-        # Probable Dropouts
-        probable_dropouts = df[df['risk_level'].isin(["High", "Medium"])]
-        st.subheader("⚠️ Probable Dropouts")
-        st.dataframe(probable_dropouts[['id', 'name', 'attendance_percentage',
-                                        'maths', 'dsa', 'oop', 'economics',
-                                        'fees_paid', 'risk_level']])
-
-        # Risk Distribution Pie Chart
-        st.subheader("📊 Risk Distribution of All Students")
-        risk_counts = df['risk_level'].value_counts()
-        fig_pie, ax_pie = plt.subplots()
-        ax_pie.pie(risk_counts, labels=risk_counts.index, autopct="%1.1f%%",
-                   startangle=90, colors=["lightgreen", "yellow", "orange", "red"])
-        ax_pie.axis("equal")
-        st.pyplot(fig_pie)
-
-    # -----------------------------
-    # MENTOR VIEW
-    # -----------------------------
+    if mentor_students.empty:
+        st.warning("No students assigned")
     else:
-        mentor_students = df[df['mentor'].str.strip().str.lower() == username.strip().lower()]
+        st.dataframe(mentor_students.style.apply(highlight_risk, axis=1))
+        counts = mentor_students['risk_level'].value_counts()
+        color_map = {"OK": "lightgreen", "Low": "yellow", "Medium": "orange", "High": "red"}
+        fig, ax = plt.subplots()
+        ax.pie(
+            [counts.get(l, 0) for l in ["OK", "Low", "Medium", "High"]],
+            labels=["OK", "Low", "Medium", "High"],
+            autopct="%1.1f%%",
+            startangle=90,
+            colors=[color_map["OK"], color_map["Low"], color_map["Medium"], color_map["High"]],
+        )
+        ax.axis("equal")
+        st.pyplot(fig)
 
-        st.subheader(f"👨‍🏫 Students Assigned to {username}")
-        if mentor_students.empty:
-            st.warning("⚠️ No students assigned to you yet.")
+        # Send emails (only if config filled)
+        if sender_email and app_password:
+            st.subheader("📨 Send Emails to Your Students' Parents")
+            if st.button("Send Emails to My Students"):
+                for _, student in mentor_students.iterrows():
+                    send_email_to_parent(student, sender_email, app_password)
         else:
-            st.dataframe(
-                mentor_students[['id', 'name', 'attendance_percentage', 'fees_paid', 'risk_status', 'risk_level']])
+            st.info("Enter Gmail + App Password in sidebar to enable email sending.")
 
-            # Risk Distribution Pie Chart
-            st.subheader("📊 Risk Distribution of Your Students")
-            risk_counts = mentor_students['risk_level'].value_counts()
-            fig_pie, ax_pie = plt.subplots()
-            ax_pie.pie(risk_counts, labels=risk_counts.index, autopct="%1.1f%%",
-                       startangle=90, colors=["lightgreen", "yellow", "orange", "red"])
-            ax_pie.axis("equal")
-            st.pyplot(fig_pie)
+        # Student search
+        student_search = st.text_input("Search Student by ID or Name")
+        if student_search:
+            filtered = mentor_students[
+                (mentor_students['id'].astype(str) == student_search) |
+                (mentor_students['name'].str.contains(student_search, case=False))
+            ]
+            if not filtered.empty:
+                st.dataframe(filtered.style.apply(highlight_risk, axis=1))
+                avg_attendance = mentor_students['total_attendance'].mean()
+                st.write(f"Class average attendance: {avg_attendance:.2f}%")
+                for _, row in filtered.iterrows():
+                    st.write(f"{row['name']}'s attendance vs class: {row['total_attendance']}% vs {avg_attendance:.2f}%")
+            else:
+                st.warning("Student not found")
 
-            # Select student
-            student_choice = st.selectbox("Select a Student:", mentor_students['name'])
-            student_data = mentor_students[mentor_students['name'] == student_choice].iloc[0]
+# -----------------------------
+# STUDENT PAGE
+# -----------------------------
+def student_page():
+    student_id = st.session_state.get("student_id")
+    role = st.session_state.get("role")
+    if role != "student" or not student_id:
+        st.warning("Student not logged in. Please login first.")
+        login_page()
+        return
 
-            st.subheader(f"📌 Details for {student_choice}")
-            st.write(student_data)
+    logout_button()
+    st.header(f"👩‍🎓 Student Dashboard - ID {student_id}")
 
-            # Student vs Class Average
-            avg_scores = df[['maths', 'dsa', 'oop', 'economics']].mean()
-            fig, ax = plt.subplots()
-            student_scores = [student_data['maths'], student_data['dsa'], student_data['oop'],
-                              student_data['economics']]
-            subjects = ['Maths', 'DSA', 'OOP', 'Economics']
+    df = fetch_students()
+    df['risk_status'] = df.apply(calculate_risk, axis=1)
+    df['risk_level'] = df.apply(assign_risk_level, axis=1)
 
-            x = range(len(subjects))
-            ax.bar(x, student_scores, width=0.4, label=f"{student_choice}", align="center")
-            ax.bar([i + 0.4 for i in x], avg_scores, width=0.4, label="Class Average", align="center")
-            ax.set_xticks([i + 0.2 for i in x])
-            ax.set_xticklabels(subjects)
-            ax.set_ylabel("Scores")
-            ax.set_title("Student vs Class Average")
-            ax.legend()
-            st.pyplot(fig)
+    student_df = df[df['id'] == student_id]
+    if student_df.empty:
+        st.error("⚠️ No student record found. Please contact admin.")
+        return
 
-            # Attendance comparison
-            fig2, ax2 = plt.subplots()
-            ax2.bar(["Student", "Class Avg"],
-                    [student_data['attendance_percentage'], df['attendance_percentage'].mean()],
-                    color=["blue", "green"])
-            ax2.set_ylabel("Attendance %")
-            st.pyplot(fig2)
+    student = student_df.iloc[0]
+    st.write(student[['name', 'total_attendance', 'maths', 'dsa', 'oop', 'economics', 'risk_level']])
 
-            # Fees comparison
-            fig3, ax3 = plt.subplots()
-            ax3.bar(["Student", "Class Avg"],
-                    [student_data['fees_paid'], df['fees_paid'].mean()],
-                    color=["purple", "orange"])
-            ax3.set_ylabel("Fees Paid")
-            st.pyplot(fig3)
+    # AI Chatbot
+    user_message = st.text_input("Ask your AI mentor for help:")
+    if user_message:
+        response = chat_with_ai(user_message)
+        st.write(response)
 
-    if st.button("🚪 Logout"):
-        logout()
-        st.rerun()
+# -----------------------------
+# MAIN
+# -----------------------------
+def main():
+    role = st.session_state.get("role")
+    if not role:
+        login_page()
+    else:
+        if role == "admin":
+            admin_page()
+        elif role == "mentor":
+            mentor_page()
+        elif role == "student":
+            student_page()
+
+if __name__ == "__main__":
+    main()
