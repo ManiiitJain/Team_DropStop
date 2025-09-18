@@ -4,6 +4,7 @@ This is a Streamlit-based web application that integrates with PostgreSQL and Go
 It provides dashboards for Admins, Mentors, and Students with features like CSV uploads, AI chatbot support, performance analysis, and email notifications.
 
 🚀 Features
+
 🔑 Login Portal
 
 Admin Login → Upload CSVs, manage records, view risk analysis, send emails to all parents.
