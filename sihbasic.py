@@ -8,12 +8,12 @@ from psycopg2 import sql
 from datetime import datetime
 import smtplib
 from email.message import EmailMessage
-import google.generativeai as genai  # ✅ Gemini import
+import google.generativeai as genai  
 
 # -----------------------------
 # CONFIGURATION
 # -----------------------------
-genai.configure(api_key="YOUR_GEMINI_API_KEY")  # ✅ Replace with your Gemini API key
+genai.configure(api_key="YOUR_GEMINI_API_KEY")  
 DB_URL = "postgresql://postgres.ixhqsbvdalrefnotxmqi:wwcbN4nmUC1YLW9C@aws-1-ap-southeast-1.pooler.supabase.com:6543/postgres"
 STUDENTS_PER_MENTOR = 50
 
